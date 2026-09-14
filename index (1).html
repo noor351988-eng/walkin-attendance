@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>تسجيل الحضور الوجاهي</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--accent:#22c55e;--danger:#ef4444;--text:#f1f5f9;--muted:#94a3b8;--border:#334155;}
+  *{box-sizing:border-box;}
+  body{font-family:Tahoma,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:16px;}
+  h1{font-size:20px;margin:0 0 16px;}
+  h2{font-size:16px;color:var(--muted);margin:24px 0 8px;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;}
+  label{display:block;font-size:13px;color:var(--muted);margin:8px 0 4px;}
+  input,select,button{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#0f172a;color:var(--text);font-size:14px;}
+  button{background:var(--accent);color:#04170a;font-weight:bold;border:none;cursor:pointer;margin-top:10px;}
+  button.secondary{background:transparent;color:var(--text);border:1px solid var(--border);}
+  button:disabled{opacity:0.5;cursor:not-allowed;}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+  .tabs button{width:auto;flex:1;background:var(--card);color:var(--text);border:1px solid var(--border);margin:0;}
+  .tabs button.active{background:var(--accent);color:#04170a;}
+  .msg{padding:10px;border-radius:8px;margin-top:10px;font-size:13px;}
+  .msg.ok{background:#052e1a;color:#4ade80;border:1px solid #16653a;}
+  .msg.err{background:#2e0505;color:#f87171;border:1px solid #651616;}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}
+  th,td{border:1px solid var(--border);padding:6px;text-align:center;}
+  #qr-display{display:flex;flex-direction:column;align-items:center;padding:20px;}
+  #qr-canvas-wrap{background:white;padding:16px;border-radius:12px;}
+  #reader{width:100%;max-width:400px;margin:0 auto;}
+  .hidden{display:none;}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:var(--border);}
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+/* ============== الإعدادات — عدّل هذول بعد إنشاء مشروع Supabase ============== */
+const FUNCTIONS_URL = "https://YOUR-PROJECT-REF.supabase.co/functions/v1";
+/* ============================================================================ */
+
+const params = new URLSearchParams(location.search);
+const role = params.get("role") === "monitor" ? "monitor" : "student";
+const app = document.getElementById("app");
+
+function getDeviceId(){
+  let id = localStorage.getItem("device_id");
+  if(!id){ id = crypto.randomUUID(); localStorage.setItem("device_id", id); }
+  return id;
+}
+
+function msg(text, ok){
+  return `<div class="msg ${ok?'ok':'err'}">${text}</div>`;
+}
+
+async function callFn(name, body, monitorKey){
+  const headers = { "Content-Type":"application/json" };
+  if(monitorKey) headers["x-monitor-key"] = monitorKey;
+  const res = await fetch(`${FUNCTIONS_URL}/${name}`, { method:"POST", headers, body: JSON.stringify(body||{}) });
+  const data = await res.json();
+  if(!res.ok) throw new Error(data.error || "حدث خطأ");
+  return data;
+}
+
+/* =========================== واجهة الطالب =========================== */
+function renderStudent(){
+  app.innerHTML = `
+    <h1>تسجيل الحضور</h1>
+    <div class="card">
+      <label>الرقم الجامعي</label>
+      <input id="uni-number" placeholder="اكتب رقمك الجامعي" value="${localStorage.getItem('uni_number')||''}"/>
+    </div>
+    <div class="card">
+      <div id="reader"></div>
+      <div id="scan-result"></div>
+    </div>
+  `;
+
+  const html5QrCode = new Html5Qrcode("reader");
+  let busy = false;
+
+  async function onScanSuccess(decodedText){
+    if(busy) return;
+    const uniNumber = document.getElementById("uni-number").value.trim();
+    if(!uniNumber){
+      document.getElementById("scan-result").innerHTML = msg("اكتب رقمك الجامعي قبل المسح", false);
+      return;
+    }
+    localStorage.setItem("uni_number", uniNumber);
+    busy = true;
+    try{
+      const data = await callFn("submit-scan", {
+        token: decodedText,
+        university_number: uniNumber,
+        device_fingerprint: getDeviceId(),
+      });
+      document.getElementById("scan-result").innerHTML = msg(data.message, data.ok);
+    }catch(e){
+      document.getElementById("scan-result").innerHTML = msg(e.message, false);
+    }
+    setTimeout(()=>{ busy = false; }, 3000); // يمنع إعادة إرسال نفس المسح خلال 3 ثواني
+  }
+
+  html5QrCode.start(
+    { facingMode: "environment" },
+    { fps: 10, qrbox: 250 },
+    onScanSuccess,
+    ()=>{}
+  ).catch(err=>{
+    document.getElementById("scan-result").innerHTML = msg("تعذّر فتح الكاميرا: "+err, false);
+  });
+}
+
+/* =========================== واجهة المراقب =========================== */
+function renderMonitor(){
+  const savedKey = sessionStorage.getItem("monitor_key");
+  if(!savedKey){
+    app.innerHTML = `
+      <h1>دخول المراقب</h1>
+      <div class="card">
+        <label>مفتاح المراقب</label>
+        <input id="mkey" type="password" placeholder="أدخل المفتاح السري"/>
+        <button id="mkey-btn">دخول</button>
+        <div id="mkey-msg"></div>
+      </div>`;
+    document.getElementById("mkey-btn").onclick = async ()=>{
+      const key = document.getElementById("mkey").value.trim();
+      try{
+        await callFn("monitor-action", { action:"list_universities", payload:{} }, key);
+        sessionStorage.setItem("monitor_key", key);
+        renderMonitor();
+      }catch(e){
+        document.getElementById("mkey-msg").innerHTML = msg("مفتاح غير صحيح", false);
+      }
+    };
+    return;
+  }
+
+  const MK = savedKey;
+  let state = { universities:[], halls:[], sessions:[], currentTab:"universities" };
+
+  app.innerHTML = `
+    <h1>لوحة المراقب</h1>
+    <div class="tabs">
+      <button data-tab="universities">الجامعات</button>
+      <button data-tab="halls">القاعات</button>
+      <button data-tab="roster">الروستر</button>
+      <button data-tab="sessions">الجلسات</button>
+      <button data-tab="export">التصدير</button>
+    </div>
+    <div id="tab-content"></div>
+  `;
+
+  const tabs = app.querySelectorAll(".tabs button");
+  tabs.forEach(btn=>{
+    btn.onclick = ()=>{ state.currentTab = btn.dataset.tab; renderTab(); };
+  });
+
+  function markActiveTab(){
+    tabs.forEach(b=> b.classList.toggle("active", b.dataset.tab===state.currentTab));
+  }
+
+  async function loadUniversities(){
+    const r = await callFn("monitor-action", {action:"list_universities", payload:{}}, MK);
+    state.universities = r.data || [];
+  }
+  async function loadHalls(uniId){
+    if(!uniId) { state.halls = []; return; }
+    const r = await callFn("monitor-action", {action:"list_halls", payload:{university_id:uniId}}, MK);
+    state.halls = r.data || [];
+  }
+
+  function uniOptions(){
+    return state.universities.map(u=>`<option value="${u.id}">${u.name}</option>`).join("");
+  }
+
+  async function renderTab(){
+    markActiveTab();
+    const el = document.getElementById("tab-content");
+    await loadUniversities();
+
+    if(state.currentTab === "universities"){
+      el.innerHTML = `
+        <div class="card">
+          <h2>إضافة جامعة</h2>
+          <label>اسم الجامعة</label><input id="u-name"/>
+          <label>رمز مختصر</label><input id="u-code" placeholder="مثال: HATTEEN"/>
+          <button id="u-add">إضافة</button>
+          <div id="u-msg"></div>
+        </div>
+        <div class="card">
+          <h2>الجامعات الحالية</h2>
+          <table><tr><th>الاسم</th><th>الرمز</th></tr>
+          ${state.universities.map(u=>`<tr><td>${u.name}</td><td>${u.code}</td></tr>`).join("")}
+          </table>
+        </div>`;
+      document.getElementById("u-add").onclick = async ()=>{
+        try{
+          await callFn("monitor-action", {action:"add_university", payload:{
+            name: document.getElementById("u-name").value.trim(),
+            code: document.getElementById("u-code").value.trim(),
+          }}, MK);
+          renderTab();
+        }catch(e){ document.getElementById("u-msg").innerHTML = msg(e.message,false); }
+      };
+    }
+
+    if(state.currentTab === "halls"){
+      el.innerHTML = `
+        <div class="card">
+          <label>الجامعة</label>
+          <select id="h-uni">${uniOptions()}</select>
+          <label>اسم القاعة</label><input id="h-name"/>
+          <label>كود القاعة (ثابت وفريد)</label><input id="h-code" placeholder="مثال: HALL-12"/>
+          <button id="h-add">إضافة قاعة</button>
+          <div id="h-msg"></div>
+        </div>
+        <div class="card" id="h-list"></div>`;
+      const refreshList = async ()=>{
+        const uniId = document.getElementById("h-uni").value;
+        await loadHalls(uniId);
+        document.getElementById("h-list").innerHTML = `
+          <h2>القاعات</h2>
+          <table><tr><th>الاسم</th><th>الكود</th></tr>
+          ${state.halls.map(h=>`<tr><td>${h.name}</td><td>${h.hall_code}</td></tr>`).join("")}
+          </table>`;
+      };
+      document.getElementById("h-uni").onchange = refreshList;
+      document.getElementById("h-add").onclick = async ()=>{
+        try{
+          await callFn("monitor-action", {action:"add_hall", payload:{
+            university_id: document.getElementById("h-uni").value,
+            name: document.getElementById("h-name").value.trim(),
+            hall_code: document.getElementById("h-code").value.trim(),
+          }}, MK);
+          refreshList();
+        }catch(e){ document.getElementById("h-msg").innerHTML = msg(e.message,false); }
+      };
+      if(state.universities.length) refreshList();
+    }
+
+    if(state.currentTab === "roster"){
+      el.innerHTML = `
+        <div class="card">
+          <label>الجامعة</label>
+          <select id="r-uni">${uniOptions()}</select>
+          <label>الشعبة (تُستخدم لكل طلاب الملف إن ما فيه عمود شعبة)</label>
+          <input id="r-section" placeholder="مثال: شعبة 1"/>
+          <label>ملف الروستر (Excel: اسم الطالب، الرقم الجامعي، وشعبة اختياري)</label>
+          <input id="r-file" type="file" accept=".xlsx,.xls"/>
+          <button id="r-upload">رفع الروستر</button>
+          <div id="r-msg"></div>
+        </div>`;
+      document.getElementById("r-upload").onclick = async ()=>{
+        const fileInput = document.getElementById("r-file");
+        const uniId = document.getElementById("r-uni").value;
+        const defaultSection = document.getElementById("r-section").value.trim();
+        if(!fileInput.files.length){ document.getElementById("r-msg").innerHTML = msg("اختر ملف أولًا", false); return; }
+        try{
+          const buf = await fileInput.files[0].arrayBuffer();
+          const wb = XLSX.read(buf, {type:"array"});
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+          const students = rows
+            .filter(r => r["الرقم الجامعي"])
+            .map(r => ({
+              full_name: String(r["اسم الطالب"]||"").trim(),
+              university_number: String(r["الرقم الجامعي"]).trim(),
+              section: String(r["الشعبة"]||defaultSection).trim(),
+            }));
+          // نرسلها مجمّعة حسب الشعبة لأن upload_roster يأخذ شعبة واحدة بالمرة
+          const bySection = {};
+          students.forEach(s=>{ (bySection[s.section] ||= []).push(s); });
+          let total = 0;
+          for(const section of Object.keys(bySection)){
+            const r = await callFn("monitor-action", {action:"upload_roster", payload:{
+              university_id: uniId, section, students: bySection[section],
+            }}, MK);
+            total += r.count || 0;
+          }
+          document.getElementById("r-msg").innerHTML = msg(`تم رفع ${total} طالب بنجاح`, true);
+        }catch(e){
+          document.getElementById("r-msg").innerHTML = msg(e.message, false);
+        }
+      };
+    }
+
+    if(state.currentTab === "sessions"){
+      await loadHalls(state.universities[0]?.id);
+      el.innerHTML = `
+        <div class="card">
+          <h2>إنشاء جلسة محاضرة</h2>
+          <label>الجامعة</label>
+          <select id="s-uni">${uniOptions()}</select>
+          <label>القاعة</label>
+          <select id="s-hall"></select>
+          <label>الشعبة</label><input id="s-section"/>
+          <label>عنوان المحاضرة</label><input id="s-title"/>
+          <label>تاريخ المحاضرة</label><input id="s-date" type="date"/>
+          <label>وقت البداية</label><input id="s-time" type="datetime-local"/>
+          <label>مهلة القبول (دقائق)</label><input id="s-grace" type="number" value="15"/>
+          <button id="s-create">إنشاء الجلسة وفتح شاشة القاعة</button>
+          <div id="s-msg"></div>
+        </div>`;
+      const refreshHalls = async ()=>{
+        await loadHalls(document.getElementById("s-uni").value);
+        document.getElementById("s-hall").innerHTML = state.halls.map(h=>`<option value="${h.id}">${h.name} (${h.hall_code})</option>`).join("");
+      };
+      document.getElementById("s-uni").onchange = refreshHalls;
+      await refreshHalls();
+      document.getElementById("s-create").onclick = async ()=>{
+        try{
+          const r = await callFn("monitor-action", {action:"create_session", payload:{
+            hall_id: document.getElementById("s-hall").value,
+            section: document.getElementById("s-section").value.trim(),
+            lecture_title: document.getElementById("s-title").value.trim(),
+            session_date: document.getElementById("s-date").value,
+            starts_at: new Date(document.getElementById("s-time").value).toISOString(),
+            grace_period_minutes: Number(document.getElementById("s-grace").value)||15,
+          }}, MK);
+          renderQrScreen(r.data.id, r.data.lecture_title);
+        }catch(e){ document.getElementById("s-msg").innerHTML = msg(e.message,false); }
+      };
+    }
+
+    if(state.currentTab === "export"){
+      el.innerHTML = `
+        <div class="card">
+          <label>الجامعة</label>
+          <select id="e-uni">${uniOptions()}</select>
+          <label>من تاريخ (اختياري)</label><input id="e-from" type="date"/>
+          <label>إلى تاريخ (اختياري)</label><input id="e-to" type="date"/>
+          <button id="e-run">توليد ملف الإكسل</button>
+          <div id="e-msg"></div>
+        </div>`;
+      document.getElementById("e-run").onclick = async ()=>{
+        try{
+          const r = await callFn("monitor-action", {action:"get_export_data", payload:{
+            university_id: document.getElementById("e-uni").value,
+            from_date: document.getElementById("e-from").value || null,
+            to_date: document.getElementById("e-to").value || null,
+          }}, MK);
+          buildExcel(r.sessions, r.students, r.records);
+          document.getElementById("e-msg").innerHTML = msg("تم توليد الملف وتنزيله", true);
+        }catch(e){ document.getElementById("e-msg").innerHTML = msg(e.message,false); }
+      };
+    }
+  }
+
+  function renderQrScreen(sessionId, title){
+    app.innerHTML = `
+      <h1>${title}</h1>
+      <div class="card" id="qr-display">
+        <div class="badge" id="qr-timer">--</div>
+        <div id="qr-canvas-wrap"><canvas id="qr-canvas"></canvas></div>
+        <button id="qr-close" class="secondary" style="max-width:240px;margin-top:16px;">إنهاء الجلسة</button>
+      </div>`;
+
+    let stopped = false;
+    async function tick(){
+      if(stopped) return;
+      try{
+        const r = await callFn("issue-token", { session_id: sessionId }, MK);
+        QRCode.toCanvas(document.getElementById("qr-canvas"), r.token, {width:280});
+        let remain = r.ttl_seconds;
+        document.getElementById("qr-timer").innerText = remain + "s";
+        const iv = setInterval(()=>{
+          remain -= 1;
+          if(document.getElementById("qr-timer")) document.getElementById("qr-timer").innerText = Math.max(remain,0)+"s";
+          if(remain<=0) clearInterval(iv);
+        }, 1000);
+      }catch(e){ /* تجاهل خطأ لحظي وحاول بالجولة الجاية */ }
+      if(!stopped) setTimeout(tick, 12000);
+    }
+    tick();
+
+    document.getElementById("qr-close").onclick = async ()=>{
+      stopped = true;
+      await callFn("monitor-action", {action:"close_session", payload:{session_id: sessionId}}, MK);
+      renderMonitor();
+    };
+  }
+
+  renderTab();
+}
+
+/* =========================== بناء ملف الإكسل =========================== */
+function buildExcel(sessions, students, records){
+  const wb = XLSX.utils.book_new();
+
+  // شيت مجمّع
+  const dateCols = sessions.map(s => s.session_date);
+  const summaryRows = students.map(st=>{
+    const row = { "اسم الطالب": st.full_name, "الرقم الجامعي": st.university_number };
+    let present = 0, absent = 0;
+    sessions.forEach(se=>{
+      const rec = records.find(r=> r.session_id===se.id && r.student_id===st.id);
+      const val = rec && rec.status==="حاضر" ? 1 : 0;
+      row[se.session_date] = val;
+      if(rec){ val ? present++ : absent++; }
+    });
+    row["الحضور"] = present;
+    row["الغياب"] = absent;
+    return row;
+  });
+  const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+  XLSX.utils.book_append_sheet(wb, summarySheet, "ش اولى");
+
+  // شيت لكل محاضرة
+  sessions.forEach(se=>{
+    const sectionStudents = students.filter(st=> st.section===se.section);
+    let presentCount=0, absentCount=0;
+    const tableRows = sectionStudents.map((st, i)=>{
+      const rec = records.find(r=> r.session_id===se.id && r.student_id===st.id);
+      const status = rec ? rec.status : "غائب";
+      status==="حاضر" ? presentCount++ : absentCount++;
+      return {
+        "#": i+1,
+        "اسم الطالب": st.full_name,
+        "الرقم الأكاديمي": st.university_number,
+        "الحالة": status,
+        "وقت الدخول": rec?.check_in_time || "",
+      };
+    });
+
+    const header = [
+      ["سجل الحضور والغياب"],
+      [],
+      ["اسم المحاضرة:", se.lecture_title],
+      ["الشعبة:", se.section],
+      ["التاريخ:", se.session_date],
+      ["إجمالي الطلاب:", sectionStudents.length, "حاضر:", presentCount, "غائب:", absentCount],
+      [],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(header);
+    XLSX.utils.sheet_add_json(ws, tableRows, { origin: -1 });
+    const safeName = String(se.session_date).slice(0,28);
+    XLSX.utils.book_append_sheet(wb, ws, safeName);
+  });
+
+  XLSX.writeFile(wb, "كشف_الحضور.xlsx");
+}
+
+/* =========================== نقطة البداية =========================== */
+if(role === "monitor") renderMonitor(); else renderStudent();
+</script>
+</body>
+</html>
