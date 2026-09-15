@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>تسجيل الحضور الوجاهي</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="./qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--accent:#22c55e;--danger:#ef4444;--text:#f1f5f9;--muted:#94a3b8;--border:#334155;}
+  *{box-sizing:border-box;}
+  body{font-family:Tahoma,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:16px;}
+  h1{font-size:20px;margin:0 0 16px;}
+  h2{font-size:16px;color:var(--muted);margin:24px 0 8px;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:16px;}
+  label{display:block;font-size:13px;color:var(--muted);margin:8px 0 4px;}
+  input,select,button{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#0f172a;color:var(--text);font-size:14px;}
+  button{background:var(--accent);color:#04170a;font-weight:bold;border:none;cursor:pointer;margin-top:10px;}
+  button.secondary{background:transparent;color:var(--text);border:1px solid var(--border);}
+  button:disabled{opacity:0.5;cursor:not-allowed;}
+  details.card{padding:0;overflow:hidden;}
+  details.card summary{cursor:pointer;padding:14px 16px;font-weight:bold;list-style:none;display:flex;justify-content:space-between;align-items:center;}
+  details.card summary::-webkit-details-marker{display:none;}
+  details.card summary::after{content:"▾";color:var(--muted);transition:transform .15s;}
+  details.card[open] summary::after{transform:rotate(180deg);}
+  details.card .inner{padding:0 16px 16px;}
+  .msg{padding:10px;border-radius:8px;margin-top:10px;font-size:13px;}
+  .msg.ok{background:#052e1a;color:#4ade80;border:1px solid #16653a;}
+  .msg.err{background:#2e0505;color:#f87171;border:1px solid #651616;}
+  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}
+  th,td{border:1px solid var(--border);padding:6px;text-align:center;}
+  .hidden{display:none;}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;background:var(--border);}
+  .code-display{text-align:center;padding:40px 16px;}
+  .code-display .code{font-size:72px;font-weight:900;letter-spacing:6px;color:var(--accent);direction:ltr;word-break:break-all;}
+  #reader{width:100%;max-width:400px;margin:0 auto;}
+  #qr-canvas-wrap{background:white;padding:12px;border-radius:12px;display:inline-block;}
+</style>
+</head>
+<body>
+
+<div id="app"></div>
+
+<script>
+/* ============== الإعدادات ============== */
+const FUNCTIONS_URL = "https://wicltyeasldcsvprfdnz.supabase.co/functions/v1";
+/* ========================================= */
+
+const params = new URLSearchParams(location.search);
+const roleParam = params.get("role");
+const role = roleParam === "admin" ? "admin" : roleParam === "display" ? "display" : "student";
+const hallCodeParam = params.get("hall");
+const app = document.getElementById("app");
+
+function getDeviceId(){
+  let id = localStorage.getItem("device_id");
+  if(!id){ id = crypto.randomUUID(); localStorage.setItem("device_id", id); }
+  return id;
+}
+function msg(text, ok){ return `<div class="msg ${ok?'ok':'err'}">${text}</div>`; }
+
+async function callFn(name, body, monitorKey){
+  const headers = { "Content-Type":"application/json" };
+  if(monitorKey) headers["x-monitor-key"] = monitorKey;
+  const res = await fetch(`${FUNCTIONS_URL}/${name}`, { method:"POST", headers, body: JSON.stringify(body||{}) });
+  const data = await res.json();
+  if(!res.ok) throw new Error(data.error || "حدث خطأ");
+  return data;
+}
+
+/* =========================== واجهة الطالب (مسح QR أو كتابة الكود يدوياً) =========================== */
+function renderStudent(){
+  app.innerHTML = `
+    <h1>تسجيل الحضور</h1>
+    <div class="card">
+      <label>الرقم الجامعي</label>
+      <input id="uni-number" placeholder="اكتب رقمك الجامعي" value="${localStorage.getItem('uni_number')||''}"/>
+    </div>
+    <div class="card">
+      <div id="reader"></div>
+      <div id="scan-result"></div>
+      <p style="text-align:center;color:var(--muted);font-size:13px;margin:12px 0;">لو الكاميرا ما اشتغلت، اكتب الكود يدوياً تحت</p>
+      <label>الكود (6 أرقام)</label>
+      <input id="manual-token" placeholder="مثال: 482913" inputmode="numeric" maxlength="6"/>
+      <button id="manual-submit">تسجيل حضور بالكود</button>
+    </div>
+  `;
+
+  let busy = false;
+  let lastToken = null;
+  async function doSubmit(token){
+    if(busy) return;
+    if(token === lastToken) return; // نفس الكود يلي طالع بالكاميرا، تجاهله لحد ما يتغيّر
+    const uniNumber = document.getElementById("uni-number").value.trim();
+    const resultBox = document.getElementById("scan-result");
+    if(!uniNumber){
+      resultBox.innerHTML = msg("اكتب رقمك الجامعي قبل المسح", false);
+      return;
+    }
+    lastToken = token;
+    localStorage.setItem("uni_number", uniNumber);
+    busy = true;
+    resultBox.innerHTML = msg("تم قراءة الكود، جاري التحقق...", true);
+    try{
+      const data = await callFn("submit-scan", {
+        token,
+        university_number: uniNumber,
+        device_fingerprint: getDeviceId(),
+      });
+      resultBox.innerHTML = msg(data.message, data.ok);
+    }catch(e){
+      resultBox.innerHTML = msg("خطأ: "+e.message, false);
+    }
+    setTimeout(()=>{ busy = false; }, 3000);
+  }
+
+  document.getElementById("manual-submit").onclick = ()=>{
+    const t = document.getElementById("manual-token").value.trim();
+    if(!t){ document.getElementById("scan-result").innerHTML = msg("اكتب الكود أولاً", false); return; }
+    doSubmit(t);
+  };
+
+  const html5QrCode = new Html5Qrcode("reader");
+  html5QrCode.start(
+    { facingMode: "environment" },
+    { fps: 10, qrbox: 250 },
+    (decodedText)=>{ doSubmit(decodedText); },
+    ()=>{}
+  ).catch(err=>{
+    document.getElementById("scan-result").innerHTML = msg("تعذّر فتح الكاميرا — استخدم الكتابة اليدوية تحت", false);
+  });
+}
+
+/* =========================== شاشة القاعة (QR + رقم دوّار كل 20 ثانية) =========================== */
+function renderDisplay(){
+  if(!hallCodeParam){
+    app.innerHTML = `<div class="card">${msg("هالرابط ناقصه كود القاعة (hall). اطلب الرابط الصحيح من الأدمن.", false)}</div>`;
+    return;
+  }
+  app.innerHTML = `
+    <div class="code-display">
+      <div class="badge" id="d-hall-name">قاعة ${hallCodeParam}</div>
+      <div id="qr-canvas-wrap" style="margin:16px auto;"><canvas id="qr-canvas"></canvas></div>
+      <div class="code" id="d-code" style="font-size:48px;">------</div>
+      <p style="color:var(--muted);font-size:14px;">امسح الكود بكاميرا موبايلك، أو اكتبه يدوياً لو الكاميرا تعطّلت</p>
+      <div class="badge" id="d-timer">--</div>
+      <div class="badge" id="d-count" style="margin-inline-start:8px;">عدد الحاضرين اليوم: --</div>
+    </div>
+  `;
+
+  let countdownIv = null;
+  async function tick(){
+    try{
+      const r = await callFn("get-active-session", { hall_code: hallCodeParam });
+      if(typeof QRCode === "undefined") throw new Error("مكتبة QRCode ما تحمّلت");
+      await QRCode.toCanvas(document.getElementById("qr-canvas"), r.token, {width:320, margin:3, errorCorrectionLevel:"M"});
+      document.getElementById("d-code").innerText = r.token;
+      document.getElementById("d-count").innerText = "عدد الحاضرين اليوم: " + (r.attendance_count ?? "--");
+      if(r.hall_name) document.getElementById("d-hall-name").innerText = r.hall_name + " — " + hallCodeParam;
+
+      if(countdownIv) clearInterval(countdownIv);
+      let remain = r.ttl_seconds;
+      document.getElementById("d-timer").innerText = remain + "s";
+      countdownIv = setInterval(()=>{
+        remain -= 1;
+        const t = document.getElementById("d-timer");
+        if(t) t.innerText = Math.max(remain,0)+"s"; else clearInterval(countdownIv);
+      }, 1000);
+    }catch(e){
+      const nameEl = document.getElementById("d-hall-name");
+      if(nameEl) nameEl.innerText = "خطأ: " + e.message;
+    }
+    setTimeout(tick, 5000); // نتحقق كل 5 ثواني، أسرع من مدة صلاحية الكود (20 ثانية) عشان نلحق التبديل بسرعة
+  }
+  tick();
+}
+
+/* =========================== لوحة الأدمن (3 أقسام بس) =========================== */
+function renderAdmin(){
+  const savedKey = sessionStorage.getItem("admin_key");
+  if(!savedKey){
+    app.innerHTML = `
+      <h1>دخول الأدمن</h1>
+      <div class="card">
+        <label>مفتاح الأدمن</label>
+        <input id="mkey" type="password" placeholder="أدخل المفتاح السري"/>
+        <button id="mkey-btn">دخول</button>
+        <div id="mkey-msg"></div>
+      </div>`;
+    document.getElementById("mkey-btn").onclick = async ()=>{
+      const key = document.getElementById("mkey").value.trim();
+      try{
+        await callFn("monitor-action", { action:"list_universities", payload:{} }, key);
+        sessionStorage.setItem("admin_key", key);
+        renderAdmin();
+      }catch(e){
+        document.getElementById("mkey-msg").innerHTML = msg("خطأ: "+e.message, false);
+      }
+    };
+    return;
+  }
+
+  const MK = savedKey;
+  let state = { universities:[], halls:[] };
+
+  app.innerHTML = `
+    <h1>لوحة الأدمن</h1>
+    <button class="secondary" id="logout-btn" style="margin-bottom:8px;">تسجيل خروج</button>
+    <button class="secondary" id="clear-btn" style="margin-bottom:12px;">مسح البيانات المحفوظة بالمتصفح</button>
+    <div id="clear-msg"></div>
+
+    <div class="card">
+      <label>الجامعة الحالية</label>
+      <select id="admin-uni"></select>
+      <button class="secondary" id="uni-delete-btn" style="border-color:var(--danger);color:var(--danger);">🗑️ حذف هذه الجامعة (مع كل قاعاتها وطلابها وسجل حضورها)</button>
+      <div id="uni-delete-msg"></div>
+    </div>
+
+    <details class="card" id="sec-setup" open>
+      <summary>➕ الجامعات والقاعات</summary>
+      <div class="inner">
+        <h2>إضافة جامعة</h2>
+        <label>اسم الجامعة</label><input id="u-name"/>
+        <label>رمز مختصر</label><input id="u-code" placeholder="مثال: HATTEEN"/>
+        <button id="u-add">إضافة جامعة</button>
+        <div id="u-msg"></div>
+        <h2>القاعات (الجامعة الحالية)</h2>
+        <label>اسم القاعة</label><input id="h-name"/>
+        <label>كود القاعة (يُستخدم برابط شاشة المراقب فقط — الطلاب ما بيكتبوه، بيشوفوا كود مختلف دوّار عالشاشة)</label>
+        <input id="h-code" placeholder="مثال: 123456"/>
+        <button id="h-add">إضافة قاعة</button>
+        <div id="h-msg"></div>
+        <div id="h-list"></div>
+      </div>
+    </details>
+
+    <details class="card" id="sec-roster">
+      <summary>📋 رفع روستر الطلاب</summary>
+      <div class="inner">
+        <label>الشعبة (اختياري، للتنظيم بالتصدير بس)</label>
+        <input id="r-section" placeholder="مثال: شعبة 1"/>
+        <label>ملف الروستر (Excel: عمود اسم الطالب، عمود الرقم الجامعي)</label>
+        <input id="r-file" type="file" accept=".xlsx,.xls"/>
+        <button id="r-upload">رفع الروستر</button>
+        <div id="r-msg"></div>
+      </div>
+    </details>
+
+    <details class="card" id="sec-export">
+      <summary>📤 عرض وتصدير الحضور</summary>
+      <div class="inner">
+        <label>من تاريخ (اختياري)</label><input id="e-from" type="date"/>
+        <label>إلى تاريخ (اختياري)</label><input id="e-to" type="date"/>
+        <button id="e-run">توليد ملف الإكسل</button>
+        <div id="e-msg"></div>
+      </div>
+    </details>
+  `;
+
+  document.getElementById("logout-btn").onclick = ()=>{
+    sessionStorage.removeItem("admin_key");
+    renderAdmin();
+  };
+  document.getElementById("clear-btn").onclick = ()=>{
+    localStorage.clear();
+    sessionStorage.clear();
+    document.getElementById("clear-msg").innerHTML = msg("تم مسح كل البيانات المحفوظة بالمتصفح", true);
+    setTimeout(()=>renderAdmin(), 1200);
+  };
+
+  function uniOptions(){
+    return state.universities.map(u=>`<option value="${u.id}">${u.name}</option>`).join("");
+  }
+  function currentUniId(){ return document.getElementById("admin-uni").value; }
+
+  async function loadUniversities(){
+    const r = await callFn("monitor-action", {action:"list_universities", payload:{}}, MK);
+    state.universities = r.data || [];
+  }
+  async function loadHalls(uniId){
+    if(!uniId) { state.halls = []; return; }
+    const r = await callFn("monitor-action", {action:"list_halls", payload:{university_id:uniId}}, MK);
+    state.halls = r.data || [];
+  }
+  function renderHallsList(){
+    const uniName = state.universities.find(u=>u.id===currentUniId())?.name || "";
+    document.getElementById("h-list").innerHTML = `
+      <table><tr><th>القاعة</th><th>الكود</th><th>رابط المراقب (اضغط لنسخه)</th></tr>
+      ${state.halls.map(h=>{
+        const link = `${location.origin}${location.pathname}?role=display&hall=${encodeURIComponent(h.hall_code)}`;
+        return `<tr><td>${h.name} (${uniName})</td><td><b>${h.hall_code}</b></td><td><input readonly onclick="this.select();document.execCommand('copy');" value="${link}" style="font-size:11px;padding:4px;"/></td></tr>`;
+      }).join("")}
+      </table>`;
+  }
+  async function refreshForUni(){
+    await loadHalls(currentUniId());
+    renderHallsList();
+  }
+
+  document.getElementById("admin-uni").onchange = refreshForUni;
+
+  document.getElementById("uni-delete-btn").onclick = async ()=>{
+    const uniId = currentUniId();
+    if(!uniId){ return; }
+    const uniName = state.universities.find(u=>u.id===uniId)?.name || "";
+    if(!confirm(`متأكد إنك بدك تحذف "${uniName}" مع كل قاعاتها وطلابها وسجل حضورها؟ هاد ما رح يرجع.`)) return;
+    try{
+      await callFn("monitor-action", {action:"delete_university", payload:{university_id: uniId}}, MK);
+      await loadUniversities();
+      document.getElementById("admin-uni").innerHTML = uniOptions();
+      await refreshForUni();
+      document.getElementById("uni-delete-msg").innerHTML = msg("تم الحذف", true);
+    }catch(e){ document.getElementById("uni-delete-msg").innerHTML = msg(e.message,false); }
+  };
+
+  document.getElementById("u-add").onclick = async ()=>{
+    try{
+      await callFn("monitor-action", {action:"add_university", payload:{
+        name: document.getElementById("u-name").value.trim(),
+        code: document.getElementById("u-code").value.trim(),
+      }}, MK);
+      await loadUniversities();
+      document.getElementById("admin-uni").innerHTML = uniOptions();
+      await refreshForUni();
+      document.getElementById("u-msg").innerHTML = msg("تمت الإضافة", true);
+    }catch(e){ document.getElementById("u-msg").innerHTML = msg(e.message,false); }
+  };
+
+  document.getElementById("h-add").onclick = async ()=>{
+    try{
+      await callFn("monitor-action", {action:"add_hall", payload:{
+        university_id: currentUniId(),
+        name: document.getElementById("h-name").value.trim(),
+        hall_code: document.getElementById("h-code").value.trim(),
+      }}, MK);
+      await refreshForUni();
+      document.getElementById("h-msg").innerHTML = msg("تمت الإضافة — رابط المراقب لهاي القاعة موجود بالجدول تحت", true);
+    }catch(e){ document.getElementById("h-msg").innerHTML = msg(e.message,false); }
+  };
+
+  document.getElementById("r-upload").onclick = async ()=>{
+    const fileInput = document.getElementById("r-file");
+    const uniId = currentUniId();
+    const section = document.getElementById("r-section").value.trim();
+    if(!fileInput.files.length){ document.getElementById("r-msg").innerHTML = msg("اختر ملف أولًا", false); return; }
+    try{
+      const buf = await fileInput.files[0].arrayBuffer();
+      const wb = XLSX.read(buf, {type:"array"});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, {defval:""});
+      const students = rows
+        .filter(r => r["الرقم الجامعي"])
+        .map(r => ({
+          full_name: String(r["اسم الطالب"]||"").trim(),
+          university_number: String(r["الرقم الجامعي"]).trim(),
+        }));
+      const r = await callFn("monitor-action", {action:"upload_roster", payload:{
+        university_id: uniId, section, students,
+      }}, MK);
+      document.getElementById("r-msg").innerHTML = msg(`تم رفع ${r.count||0} طالب بنجاح`, true);
+    }catch(e){
+      document.getElementById("r-msg").innerHTML = msg(e.message, false);
+    }
+  };
+
+  document.getElementById("e-run").onclick = async ()=>{
+    try{
+      const r = await callFn("monitor-action", {action:"get_attendance", payload:{
+        university_id: currentUniId(),
+        from_date: document.getElementById("e-from").value || null,
+        to_date: document.getElementById("e-to").value || null,
+      }}, MK);
+      buildExcel(r.students, r.halls, r.logs);
+      document.getElementById("e-msg").innerHTML = msg("تم توليد الملف وتنزيله", true);
+    }catch(e){ document.getElementById("e-msg").innerHTML = msg(e.message,false); }
+  };
+
+  (async ()=>{
+    await loadUniversities();
+    document.getElementById("admin-uni").innerHTML = uniOptions();
+    await refreshForUni();
+  })();
+}
+
+/* =========================== بناء ملف الإكسل =========================== */
+function buildExcel(students, halls, logs){
+  const wb = XLSX.utils.book_new();
+  const hallById = Object.fromEntries((halls||[]).map(h=>[h.id, h]));
+  const dates = Array.from(new Set((logs||[]).map(l=>l.checkin_date))).sort();
+
+  const rows = students.map(st=>{
+    const row = { "اسم الطالب": st.full_name, "الرقم الجامعي": st.university_number, "الشعبة": st.section||"" };
+    let present = 0;
+    dates.forEach(d=>{
+      const rec = logs.find(l=> l.student_id===st.id && l.checkin_date===d);
+      row[d] = rec ? 1 : 0;
+      if(rec) present++;
+    });
+    row["مجموع الحضور"] = present;
+    return row;
+  });
+  const sheet = XLSX.utils.json_to_sheet(rows);
+  XLSX.utils.book_append_sheet(wb, sheet, "سجل الحضور");
+
+  // شيت تفاصيل خام (وقت الدخول والخروج والمدة لكل طالب)
+  const rawRows = (logs||[]).map(l=>{
+    const st = students.find(s=>s.id===l.student_id);
+    const hall = hallById[l.hall_id];
+    const durationMin = l.left_at
+      ? Math.round((new Date(l.left_at) - new Date(l.checked_in_at)) / 60000)
+      : "";
+    return {
+      "التاريخ": l.checkin_date,
+      "وقت الدخول": new Date(l.checked_in_at).toLocaleTimeString('ar-EG'),
+      "وقت الخروج": l.left_at ? new Date(l.left_at).toLocaleTimeString('ar-EG') : "لم يسجّل خروج",
+      "مدة الحضور (دقيقة)": durationMin,
+      "اسم الطالب": st?.full_name || "",
+      "الرقم الجامعي": st?.university_number || "",
+      "القاعة": hall?.name || "",
+    };
+  });
+  const rawSheet = XLSX.utils.json_to_sheet(rawRows);
+  XLSX.utils.book_append_sheet(wb, rawSheet, "تفاصيل كل تسجيل");
+
+  XLSX.writeFile(wb, "كشف_الحضور.xlsx");
+}
+
+/* =========================== نقطة البداية =========================== */
+if(role === "admin") renderAdmin();
+else if(role === "display") renderDisplay();
+else renderStudent();
+</script>
+</body>
+</html>
